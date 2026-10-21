@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watergate: Undetected</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101923;color:#eaf2f8;font:15px system-ui,Arial;text-align:center}
+h1{margin:12px 0 4px;font-size:25px}p{margin:4px 10px 10px;color:#b9c8d5}
+#bar{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap;margin:10px}
+button,select{background:#25394b;color:white;border:1px solid #5f7b91;border-radius:7px;padding:8px 12px}
+canvas{display:block;margin:0 auto 16px;width:min(96vw,960px);height:auto;border:2px solid #52697a;background:#182532}
+#msg{min-height:24px;color:#ffd777;font-weight:600}
+</style></head>
+<body>
+<h1>WATERGATE: UNDETECTED</h1>
+<p>Move with WASD or arrow keys. Press E to interact. Guards now navigate around walls instead of walking through them.</p>
+<div id="bar"><label>Difficulty <select id="difficulty"><option value="easy">Easy</option><option value="normal" selected>Normal</option><option value="hard">Hard</option></select></label><button id="restart">Restart</button><span id="status">Evidence: 0/3 · Screwdriver: No · Vault: Locked</span></div>
+<div id="msg">Find the screwdriver, collect evidence, open the vault, then escape.</div>
+<canvas id="game" width="960" height="600"></canvas>
+<script>
+(()=>{
+const c=document.getElementById('game'),ctx=c.getContext('2d'),msg=document.getElementById('msg'),status=document.getElementById('status');
+const T=32,COLS=30,ROWS=18;
+let map,player,guards,evidence,tool,vault,docs,won,lost,insideVent,keys,combinationOpen;
+const diff={easy:{speed:48,range:145},normal:{speed:65,range:185},hard:{speed:82,range:225}};
+const vents=[[3,1],[7,6],[17,9],[26,12]];
+function reset(){
+ map=Array.from({length:ROWS},(_,y)=>Array.from({length:COLS},(_,x)=>(x===0||y===0||x===COLS-1||y===ROWS-1)?1:0));
+ // Rooms and corridors: walls form barriers but leave doorways.
+ for(let x=4;x<12;x++)map[4][x]=1;
+ map[4][7]=0;
+ for(let y=2;y<9;y++)map[y][13]=1;map[5][13]=0;
+ for(let x=15;x<25;x++)map[8][x]=1;map[8][20]=0;
+ for(let y=9;y<15;y++)map[y][9]=1;map[12][9]=0;
+ for(let x=11;x<19;x++)map[13][x]=1;map[13][15]=0;
+ // desks / cabinets
+ [[5,2],[6,2],[10,6],[11,6],[16,3],[17,3],[22,5],[23,5],[3,10],[4,10],[20,11],[21,11],[24,14]].forEach(([x,y])=>map[y][x]=1);
+ player={x:2.5*T,y:2.5*T,r:10};guards=[
+ {x:15.5*T,y:2.5*T,goal:[24,2],path:[],repath:0},
+ {x:6.5*T,y:8.5*T,goal:[2,8],path:[],repath:0},
+ {x:18.5*T,y:15.5*T,goal:[26,15],path:[],repath:0},
+ {x:26.5*T,y:5.5*T,goal:[16,6],path:[],repath:0}
+ ];
+ evidence=[[8.5*T,2.5*T],[18.5*T,6.5*T],[25.5*T,15.5*T]].map(([x,y])=>({x,y,got:false}));
+ tool={x:3.5*T,y:14.5*T,got:false};vault={x:26.5*T,y:2.5*T,open:false};docs=false;won=false;lost=false;insideVent=false;combinationOpen=false;keys={};setMessage('Find the screwdriver and three evidence files. Guards patrol and route around walls.');updateStatus();
+}
+function setMessage(s){msg.textContent=s}
+function updateStatus(){status.textContent=`Evidence: ${evidence.filter(e=>e.got).length}/3 · Screwdriver: ${tool.got?'Yes':'No'} · Vault: ${docs?'Documents taken':vault.open?'Open':'Locked'}`}
+function solid(px,py){let x=Math.floor(px/T),y=Math.floor(py/T);return x<0||y<0||x>=COLS||y>=ROWS||map[y][x]===1}
+function canMove(x,y,r){return !solid(x-r,y-r)&&!solid(x+r,y-r)&&!solid(x-r,y+r)&&!solid(x+r,y+r)}
+function moveWithCollision(ent,dx,dy,r){
+ // Small substeps prevent tunnelling through thin walls; axis separation lets characters slide along walls.
+ let n=Math.max(1,Math.ceil(Math.max(Math.abs(dx),Math.abs(dy))/4)),sx=dx/n,sy=dy/n;
+ for(let i=0;i<n;i++){if(canMove(ent.x+sx,ent.y,r))ent.x+=sx;if(canMove(ent.x,ent.y+sy,r))ent.y+=sy;}
+}
+function cell(x,y){return [Math.floor(x/T),Math.floor(y/T)]}
+function bfs(sx,sy,gx,gy){
+ const start=cell(sx,sy),goal=[gx,gy],q=[start],prev=new Map(),key=(x,y)=>x+','+y;
+ prev.set(key(...start),null);
+ for(let i=0;i<q.length;i++){let [x,y]=q[i];if(x===gx&&y===gy)break;
+  for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){let nx=x+dx,ny=y+dy,k=key(nx,ny);if(nx<1||ny<1||nx>=COLS-1||ny>=ROWS-1||map[ny][nx]||prev.has(k))continue;prev.set(k,[x,y]);q.push([nx,ny]);}
+ }
+ let k=key(...goal);if(!prev.has(k))return [];
+ let out=[];while(k){let [x,y]=k.split(',').map(Number);out.unshift([x+.5,y+.5]);let p=prev.get(k);k=p?key(...p):null;}return out;
+}
+function nearestFree(x,y){let [cx,cy]=cell(x,y);if(!solid((cx+.5)*T,(cy+.5)*T))return [cx,cy];for(let r=1;r<8;r++)for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){let nx=cx+dx,ny=cy+dy;if(nx>0&&ny>0&&nx<COLS-1&&ny<ROWS-1&&!map[ny][nx])return[nx,ny]}return[2,2]}
+function interact(){
+ if(won||lost)return;
+ const near=(x,y,range=34)=>Math.hypot(player.x-x,player.y-y)<range;
+ if(insideVent){insideVent=false;let [x,y]=nearestFree(player.x,player.y);player.x=(x+.5)*T;player.y=(y+.5)*T;setMessage('You climbed out of the vent.');return}
+ let vent=vents.find(([x,y])=>near((x+.5)*T,(y+.5)*T,28));
+ if(vent){let idx=vents.findIndex(v=>v===vent),dest=vents[(idx+1)%vents.length];insideVent=true;player.x=(dest[0]+.5)*T;player.y=(dest[1]+.5)*T;setMessage(`Vent route: grate ${idx+1} → grate ${(idx+1)%vents.length+1}. Press E to climb out.`);return}
+ if(!tool.got&&near(tool.x,tool.y)){tool.got=true;setMessage('Screwdriver collected! Find the vault.');updateStatus();return}
+ let ev=evidence.find(e=>!e.got&&near(e.x,e.y));if(ev){ev.got=true;setMessage('Evidence file collected.');updateStatus();return}
+ if(near(vault.x,vault.y,42)){
+   if(!tool.got){setMessage('The vault panel needs a screwdriver first.');return}
+   if(!vault.open){vault.open=true;combinationOpen=true;setMessage('Panel removed! Enter the vault code: click the buttons below.');return}
+   if(!docs){if(evidence.filter(e=>e.got).length<3){setMessage('The vault is open, but collect all 3 evidence files first.');return}docs=true;setMessage('Secret documents secured! Reach the green exit.');updateStatus();return}
+ }
+ if(near(28.5*T,16.5*T,42)){if(!docs||evidence.some(e=>!e.got)){setMessage('You need all evidence and the secret documents first.');return}won=true;setMessage('MISSION COMPLETE — you escaped with the evidence!');}
+}
+function guardUpdate(g,dt){
+ if(insideVent||won||lost)return;
+ const settings=diff[document.getElementById('difficulty').value];
+ let dist=Math.hypot(player.x-g.x,player.y-g.y);
+ // Guards only chase if they have an unobstructed line of sight.
+ function lineOfSight(){let n=Math.ceil(dist/8);for(let i=1;i<n;i++){let x=g.x+(player.x-g.x)*i/n,y=g.y+(player.y-g.y)*i/n;if(solid(x,y))return false}return true}
+ if(dist<settings.range&&lineOfSight()){g.path=bfs(g.x,g.y,...cell(player.x,player.y));g.repath=.22}
+ else {g.repath-=dt;if(g.repath<=0||!g.path.length){g.goal=g.goal||[3,3];let [gx,gy]=g.goal;g.path=bfs(g.x,g.y,gx,gy);if(Math.hypot(g.x-(gx+.5)*T,g.y-(gy+.5)*T)<12){g.goal=[[24,2],[2,8],[26,15],[16,6]][Math.floor(Math.random()*4)]}g.repath=1.1}}
+ if(g.path.length){let [tx,ty]=g.path[0],dx=tx*T-g.x,dy=ty*T-g.y,d=Math.hypot(dx,dy);if(d<6)g.path.shift();else moveWithCollision(g,dx/d*settings.speed*dt,dy/d*settings.speed*dt,10)}
+ if(dist<19){lost=true;setMessage('CAUGHT! Press Restart to try again.')}
+}
+function draw(){
+ ctx.clearRect(0,0,c.width,c.height);
+ for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){ctx.fillStyle=map[y][x]?'#53606a':((x+y)%2?'#202f3b':'#243542');ctx.fillRect(x*T,y*T,T,T);if(map[y][x]){ctx.fillStyle='#6d7b86';ctx.fillRect(x*T+2,y*T+2,T-4,T-4)}}
+ // Visible, labelled vent routes
+ ctx.save();ctx.strokeStyle='#39bde8';ctx.lineWidth=3;ctx.setLineDash([7,6]);ctx.beginPath();vents.forEach(([x,y],i)=>{let nx=vents[(i+1)%vents.length][0],ny=vents[(i+1)%vents.length][1];ctx.moveTo((x+.5)*T,(y+.5)*T);ctx.lineTo((nx+.5)*T,(ny+.5)*T)});ctx.stroke();ctx.restore();
+ vents.forEach(([x,y],i)=>{ctx.fillStyle='#0b8bb6';ctx.fillRect(x*T+4,y*T+4,T-8,T-8);ctx.fillStyle='white';ctx.font='bold 13px sans-serif';ctx.fillText('V'+(i+1),x*T+7,y*T+20)});
+ evidence.forEach((e,i)=>{if(!e.got){ctx.fillStyle='#ffd54b';ctx.fillRect(e.x-8,e.y-10,16,20);ctx.fillStyle='#755800';ctx.fillRect(e.x-4,e.y-5,8,2)}});
+ if(!tool.got){ctx.strokeStyle='#e5e9ef';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(tool.x-7,tool.y+7);ctx.lineTo(tool.x+7,tool.y-7);ctx.stroke();ctx.fillStyle='#ff9e54';ctx.fillRect(tool.x-10,tool.y+3,9,6)}
+ ctx.fillStyle=vault.open?'#a47c4a':'#b18a55';ctx.fillRect(vault.x-16,vault.y-15,32,30);ctx.strokeStyle='#f4d29b';ctx.strokeRect(vault.x-16,vault.y-15,32,30);ctx.fillStyle='#20252b';ctx.fillRect(vault.x-3,vault.y-4,6,9);
+ // Exit
+ ctx.fillStyle='#25c878';ctx.fillRect(27*T+4,15*T+4,3*T-8,2*T-8);ctx.fillStyle='#063b23';ctx.font='bold 16px sans-serif';ctx.fillText('EXIT',27*T+16,16*T+20);
+ guards.forEach(g=>{ctx.fillStyle='rgba(255,65,65,.12)';ctx.beginPath();ctx.arc(g.x,g.y,110,0,Math.PI*2);ctx.fill();ctx.fillStyle='#e44f55';ctx.beginPath();ctx.arc(g.x,g.y,11,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fff';ctx.fillRect(g.x-4,g.y-3,3,3);ctx.fillRect(g.x+2,g.y-3,3,3)});
+ ctx.fillStyle=insideVent?'#56d7ff':'#72f2a4';ctx.beginPath();ctx.arc(player.x,player.y,10,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#eafff2';ctx.lineWidth=2;ctx.stroke();
+ if(combinationOpen&&!docs){ctx.fillStyle='rgba(5,10,15,.82)';ctx.fillRect(300,220,360,155);ctx.fillStyle='white';ctx.font='bold 20px sans-serif';ctx.fillText('VAULT COMBINATION',350,252);ctx.font='16px sans-serif';ctx.fillText('Choose a code:',405,279);['1 2 3','4 2 6','7 1 9'].forEach((s,i)=>{ctx.fillStyle='#36536b';ctx.fillRect(330+i*105,300,95,45);ctx.fillStyle='white';ctx.fillText(s,350+i*105,328)});ctx.font='12px sans-serif';ctx.fillText('Click a code to try it',405,362)}
+}
+function loop(now){let dt=Math.min(.04,(now-(loop.last||now))/1000);loop.last=now;
+ if(!won&&!lost&&!insideVent){let speed=155*(keys.shift?0.55:1),dx=0,dy=0;if(keys.ArrowUp||keys.w)dy--;if(keys.ArrowDown||keys.s)dy++;if(keys.ArrowLeft||keys.a)dx--;if(keys.ArrowRight||keys.d)dx++;if(dx&&dy){dx*=.707;dy*=.707}moveWithCollision(player,dx*speed*dt,dy*speed*dt,10)}
+ guards.forEach(g=>guardUpdate(g,dt));draw();requestAnimationFrame(loop)}
+window.addEventListener('keydown',e=>{let k=e.key.length===1?e.key.toLowerCase():e.key;keys[k]=true;if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key))e.preventDefault();if(k==='e')interact()});
+window.addEventListener('keyup',e=>{let k=e.key.length===1?e.key.toLowerCase():e.key;keys[k]=false});
+c.addEventListener('click',e=>{if(!combinationOpen||docs)return;let r=c.getBoundingClientRect(),x=(e.clientX-r.left)*c.width/r.width,y=(e.clientY-r.top)*c.height/r.height;if(y>300&&y<345){let i=Math.floor((x-330)/105);if(i===1){docs=true;combinationOpen=false;setMessage('Correct code! Secret documents secured. Collect any remaining evidence and escape.');updateStatus()}else setMessage('Incorrect code. Try another combination.')}});
+document.getElementById('restart').onclick=reset;document.getElementById('difficulty').onchange=()=>setMessage('Difficulty changed. Guard speed and vision update immediately.');
+reset();requestAnimationFrame(loop);
+})();
+</script></body></html>
